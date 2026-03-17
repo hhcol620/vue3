@@ -2375,12 +2375,14 @@ function baseCreateRenderer(
   let isFlushing = false
   const render: RootRenderFunction = (vnode, container, namespace) => {
     let instance
+    // 新的为空 旧的存在，旧的就卸载
     if (vnode == null) {
       if (container._vnode) {
         unmount(container._vnode, null, null, true)
         instance = container._vnode.component
       }
     } else {
+      // 新的不为空 进行patch，container._vnode为null 表示第一次挂载
       patch(
         container._vnode || null,
         vnode,
