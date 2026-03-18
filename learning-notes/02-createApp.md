@@ -194,7 +194,69 @@ return {
 
 ---
 
-## 五、为什么 `createAppAPI` 要预注入 `render`，而不用同层的那个 `render`
+## 五、`createAppAPI(render, hydrate)` 详解（`apiCreateApp.ts:253`）
+
+### 作用
+
+工厂函数的工厂函数：接收平台相关的 `render` 和 `hydrate`，返回 `createApp` 函数本身。
+
+```typescript
+createAppAPI(render, hydrate)
+  └─► 返回 createApp(rootComponent, rootProps)
+        └─► 创建 appContext
+        └─► 构造 app 对象，挂载所有公开方法
+```
+
+### 两个参数含义
+
+| 参数 | 含义 |
+|------|------|
+| `render` | 客户端渲染函数，patch vnode → 真实 DOM |
+| `hydrate` | SSR 激活函数，已有服务端 HTML → 绑定事件/响应式（可选） |
+
+两者在 `mount` 内部的分叉点（`apiCreateApp.ts:395`）：
+
+```typescript
+if (isHydrate && hydrate) {
+  hydrate(vnode, rootContainer)         // SSR：不重建 DOM，只激活
+} else {
+  render(vnode, rootContainer, namespace) // CSR：从零构建 DOM
+}
+```
+
+### `app` 对象上挂了哪些方法
+
+```
+app.use()        → 安装插件（WeakSet 去重，防重复安装）
+app.mixin()      → 全局 mixin（Options API 专用）
+app.component()  → 注册/查询全局组件（存入 context.components）
+app.directive()  → 注册/查询全局指令（存入 context.directives）
+app.provide()    → 全局 provide（存入 context.provides）
+app.mount()      → 挂载（见下方详解）
+app.unmount()    → 调 render(null, container) 触发卸载
+app.onUnmount()  → 注册卸载回调
+```
+
+### `mount` 内部做了什么（`apiCreateApp.ts:358`）
+
+除调用 `render` 外，还有 5 件事：
+
+```
+mount(rootContainer)
+  ├─ 1. isMounted 检查（幂等保护，同一 app 只能挂载一次）
+  ├─ 2. createVNode(rootComponent) + vnode.appContext = context
+  │      ↑ 把全局 config/components/directives 注入根 vnode，整棵树可访问
+  ├─ 3. DEV：注册 context.reload()（Vite HMR 热更新根组件用）
+  ├─ 4. render(vnode, container) 或 hydrate(...)
+  ├─ 5. isMounted=true，_container=rootContainer
+  │      container.__vue_app__ = app（Vue Devtools 识别挂载点的标记）
+  └─ 6. return getComponentPublicInstance(vnode.component!)
+         ↑ 即 app.mount('#app') 的返回值，等价于 Options API 的 this
+```
+
+---
+
+## 六、为什么 `createAppAPI` 要预注入 `render`，而不用同层的那个 `render`
 
 `runtime-dom/index.ts` 里有两个 `render`，**它们是完全不同的东西**：
 

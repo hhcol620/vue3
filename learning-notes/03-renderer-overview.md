@@ -75,6 +75,146 @@ effect 触发 → update()
 
 ---
 
+## render 与 container._vnode（第 2376 行）
+
+`render(vnode, container)` 是整个渲染树的根入口：
+
+```typescript
+const render: RootRenderFunction = (vnode, container, namespace) => {
+  if (vnode == null) {
+    if (container._vnode) unmount(container._vnode, ...)  // 卸载
+  } else {
+    patch(container._vnode || null, vnode, container, ...)  // 挂载或更新
+  }
+  container._vnode = vnode  // 渲染完成后保存，作为下次的"老 vnode"
+}
+```
+
+`container._vnode` 是挂在 DOM 节点上的自定义属性，作用是**保存上一次的渲染结果**：
+
+```
+首次渲染：patch(null, vnode, ...)               → container._vnode = vnode
+数据更新：patch(container._vnode, newVnode, ...) → container._vnode = newVnode
+卸载：    vnode 传 null → unmount(container._vnode)  → container._vnode = null
+```
+
+### render 完成后的 flush 回调（第 2397-2402 行）
+
+```typescript
+if (!isFlushing) {
+  isFlushing = true
+  flushPreFlushCbs(instance)   // 执行 pre 队列：watch(flush:'pre') 的回调
+  flushPostFlushCbs()           // 执行 post 队列：onMounted / onUpdated 等
+  isFlushing = false
+}
+```
+
+Vue 里的副作用不立即执行，而是推入队列批量处理：
+
+| 队列 | 对应 API | 时机 |
+|------|---------|------|
+| pre flush | `watch(flush:'pre')` | DOM 更新后、生命周期前 |
+| post flush | `onMounted` / `onUpdated` | DOM 完全稳定后 |
+
+`isFlushing` 标志位的作用：防止在 flush 过程中（如 `onMounted` 里修改数据）再次触发 `render`，形成递归 flush 死循环。
+
+> `flushPreFlushCbs` / `flushPostFlushCbs` 的队列调度机制在 `scheduler.ts`，暂跳过。
+
+---
+
+## patch 函数详解（第 374 行）
+
+### 参数含义
+
+```typescript
+patch(
+  n1,              // 老 vnode（首次挂载为 null）
+  n2,              // 新 vnode（目标状态）
+  container,       // 挂载的父 DOM 节点
+  anchor,          // 插入锚点：insertBefore(el, anchor)，null 则 appendChild
+  parentComponent, // 父组件实例（用于 provide/inject、错误冒泡）
+  parentSuspense,  // 最近的 Suspense 边界
+  namespace,       // 'svg' | 'mathml' | undefined
+  slotScopeIds,    // scoped CSS slot 相关
+  optimized,       // 是否走编译器优化路径（Block Tree）
+)
+```
+
+重点关注前 4 个，后面的在主流程里基本透传。
+
+### 内部三步逻辑
+
+**第一步：快速剪枝**（385-398 行）
+
+```typescript
+if (n1 === n2) return  // 同一对象，直接跳过
+
+if (n1 && !isSameVNodeType(n1, n2)) {
+  // 类型变了（div→span，或组件A→组件B）
+  // 无法复用，卸载老的，n1 置 null，让后续走"首次挂载"逻辑
+  unmount(n1, ...)
+  n1 = null
+}
+```
+
+**第二步：按 vnode 类型分发**（401-483 行）
+
+```
+n2.type 的值            走哪个处理函数
+────────────────────────────────────────────────────
+Symbol(Text)         → processText
+Symbol(Comment)      → processCommentNode
+Symbol(Static)       → mountStaticNode（v-once 静态节点）
+Symbol(Fragment)     → processFragment
+'div'/'span'/...     → shapeFlag & ELEMENT    → processElement
+组件对象              → shapeFlag & COMPONENT  → processComponent
+Teleport             → shapeFlag & TELEPORT   → TeleportImpl.process
+Suspense             → shapeFlag & SUSPENSE   → SuspenseImpl.process
+```
+
+`type` 是字符串（原生标签） → `processElement`
+`type` 是对象（组件定义）   → `processComponent`
+
+**第三步：处理 ref**（486-490 行）
+
+```typescript
+if (ref != null && parentComponent) {
+  setRef(ref, n1 && n1.ref, parentSuspense, n2 || n1, !n2)
+} else if (ref == null && n1 && n1.ref != null) {
+  setRef(n1.ref, null, parentSuspense, n1, true)
+}
+```
+
+两种场景含义：
+
+| 场景 | 条件 | 行为 |
+|------|------|------|
+| n2 有 ref | `ref != null` | 绑定/更新 ref（首次挂载或更新时） |
+| n2 没有 ref，n1 有 ref | `ref == null && n1.ref != null` | 清理老 ref，防止残留脏引用 |
+
+典型触发清理的场景：`<div v-if="show" ref="el">` 当 show 变 false，新 vnode 是 Comment 节点没有 ref，必须把 `el` 置为 null。
+
+> ⚠️ `setRef` 内部未深入，暂跳过。
+
+### patch 的作用总结
+
+> **patch 是纯粹的"分发器"**，自身不做任何 DOM 操作，只根据 vnode 类型转发给对应的 `process*` 函数，所有真正的 mount/update 逻辑都在下游。
+
+```
+patch(n1, n2)
+  ├─ n1 === n2 ──────────────────────→ return
+  ├─ 类型不同 → unmount(n1)，n1=null → 走挂载路径
+  └─ 按 type/shapeFlag 分发
+        ├─ processElement(n1, n2)
+        │     ├─ n1==null → mountElement
+        │     └─ n1!=null → patchElement
+        └─ processComponent(n1, n2)
+              ├─ n1==null → mountComponent
+              └─ n1!=null → updateComponent
+```
+
+---
+
 ## 下一步深入
 
 - [ ] `mountComponent` → `setupRenderEffect` 详细分析
