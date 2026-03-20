@@ -10,7 +10,7 @@
 | 04-mountComponent.md | 组件挂载：mountComponent 完整流程 | 🔜 |
 | 05-patch-diff.md | DOM 更新：patch / diff 算法 | 🔜 |
 | 06-compiler.md | 模板编译：template → render 函数 | 🔜 |
-| [07-reactivity.md](./07-reactivity.md) | 响应式系统：ref / reactive / computed / watch 全链路 | 🔜 |
+| [07-reactivity.md](./07-reactivity.md) | 响应式系统：ref / reactive / computed / watch 全链路 | 🔄 |
 
 ## 核心包依赖关系
 
