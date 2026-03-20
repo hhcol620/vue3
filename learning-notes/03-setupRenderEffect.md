@@ -72,17 +72,60 @@ const componentUpdateFn = () => {
 ### 第二步：配置异步调度器
 
 ```typescript
+const job: SchedulerJob = (instance.job = effect.runIfDirty.bind(effect))
+job.i = instance
+job.id = instance.uid
 effect.scheduler = () => queueJob(job)
 ```
+
+**注意**：这几行全部是赋值，**没有任何依赖收集发生**，只是在"准备工作"：
+- `job` 绑定的是 `runIfDirty`（只有 dirty 时才执行，避免重复渲染）
+- `job.i` / `job.id` 挂载实例信息，供调度器识别和排序
+- `effect.scheduler` 赋值只是告诉 effect："将来你被触发时，用这个方式通知我"
+
+**`scheduler` 何时被调用？** 在 `ReactiveEffect.trigger()` 内部：
+
+```typescript
+// reactivity/src/effect.ts
+trigger(): void {
+  if (this.flags & EffectFlags.PAUSED) {
+    pausedQueueEffects.add(this)
+  } else if (this.scheduler) {
+    this.scheduler()        // ← 有 scheduler 就调用它（异步入队）
+  } else {
+    this.runIfDirty()       // ← 没有 scheduler 就直接同步执行
+  }
+}
+```
+
+触发链：响应式数据 `.set` → 通知订阅的 effect → `effect.trigger()` → `scheduler()` → `queueJob(job)` → 异步批量执行。
 
 默认 effect 数据变化时会立刻同步重新执行。但渲染不能这么暴力——同一帧内多次数据变化会触发多次渲染。
 
 换成 scheduler 后：数据变了 → 把渲染任务推入微任务队列 → 下一个 tick 批量执行一次渲染。
 
+| | 触发时机 | 执行条件 |
+|---|---|---|
+| `update` (`effect.run`) | 主动调用，如首次挂载 | 无条件执行 |
+| `job` (`effect.runIfDirty`) | 响应式数据变更后经调度器异步执行 | 只有 dirty 才执行 |
+
 ### 第三步：首次执行 update()
 
 ```typescript
-update()  // 即 effect.run()
+update()  // 即 effect.run()，无条件同步执行
+```
+
+**这里才是依赖收集真正发生的时机**。`effect.run()` 执行时：
+
+```
+effect.run()
+  └── activeEffect = this        ← 把当前 effect 设为"激活状态"
+      └── componentUpdateFn()
+          └── renderComponentRoot()
+              └── 执行组件 render 函数
+                  └── 访问 ref/reactive 数据
+                      └── 触发 getter → track()
+                          └── 把 activeEffect 收集到该数据的订阅列表里
 ```
 
 首次执行 `componentUpdateFn`：
