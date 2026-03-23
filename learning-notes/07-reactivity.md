@@ -170,25 +170,48 @@ link.nextDep!.prevDep = link.prevDep
 
 ## 四、`track()` 内部实现（dep.ts:108）
 
+### `new Link(activeSub, dep)` 只是造节点，不接链表
+
+```typescript
+constructor(public sub: Subscriber, public dep: Dep) {
+  this.version = dep.version
+  this.nextDep = this.prevDep = this.nextSub = this.prevSub = undefined
+  // 所有指针全是 undefined，没有接入任何链表
+}
+```
+
+`public sub / dep` 只是存了两个引用，**`new Link` 本身不做任何链表操作**。
+真正的链表接入分两步，在创建之后手动完成：
+
+```
+new Link()          → 造砖：空节点，指针全 undefined
+track() 后续代码    → 砌墙①：接入 activeSub.deps 链表
+addSub()            → 砌墙②：接入 dep.subs 链表
+```
+
+### 完整代码
+
 ```typescript
 track() {
   if (!activeSub || !shouldTrack) return  // 没有 effect 在跑，不收集
 
   let link = this.activeLink
   if (link === undefined || link.sub !== activeSub) {
-    // 第一次读：新建 Link，建立 dep ↔ effect 双向关联
+
+    // ① 造节点（指针全 undefined，只存 sub 和 dep 引用）
     link = this.activeLink = new Link(activeSub, this)
 
-    // 追加到 effect 的 dep 链表尾部
+    // ② 手动接入 activeSub.deps 链表（effect 记录自己依赖了哪些 dep）
     if (!activeSub.deps) {
-      activeSub.deps = activeSub.depsTail = link
+      activeSub.deps = activeSub.depsTail = link   // 第一个节点
     } else {
-      link.prevDep = activeSub.depsTail
+      link.prevDep = activeSub.depsTail            // 手动接指针
       activeSub.depsTail!.nextDep = link
-      activeSub.depsTail = link
+      activeSub.depsTail = link                    // 更新尾指针
     }
 
-    addSub(link)  // 见下方 addSub 详解
+    // ③ 手动接入 dep.subs 链表（dep 记录谁订阅了自己）
+    addSub(link)
 
   } else if (link.version === -1) {
     // 复用：上次运行就收集过，恢复版本号即可，不重建
