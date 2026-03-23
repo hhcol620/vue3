@@ -263,7 +263,9 @@ addSub() 负责：dep ────subs──► Link   dep 知道谁订阅了自
 
 ---
 
-## 五、`trigger()` 内部实现（dep.ts:167）
+## 五、`trigger()` → `notify()` 完整通知链路
+
+### `trigger()` / `notify()`（dep.ts:167）
 
 ```typescript
 trigger() {
@@ -273,26 +275,120 @@ trigger() {
 }
 
 notify() {
-  startBatch()        // 开启批处理
+  startBatch()
   try {
     for (let link = this.subs; link; link = link.prevSub) {
-      link.sub.notify()  // 通知每个订阅的 effect
+      if (link.sub.notify()) {
+        // 返回 true = 这是个 computed，需额外通知它自己的 dep
+        ;(link.sub as ComputedRefImpl).dep.notify()
+      }
     }
   } finally {
-    endBatch()        // 批处理结束，统一调度执行
+    endBatch()
   }
 }
 ```
 
-### `startBatch` / `endBatch` 批处理
+注意遍历方向是**从尾到头**（`link.prevSub`），`endBatch` 执行时按正序触发，保证顺序一致。
 
-同一个同步任务里多次数据变化，不会立刻每次都重跑 effect，而是收集完所有变化后统一执行一次：
+### `effect.notify()`（effect.ts:139）
 
 ```typescript
-count.value++   // trigger → startBatch，effect 标记 dirty，入队
-name.value = 'x' // trigger → effect 已在队列，跳过重复入队
-// 同步代码结束 → endBatch → 统一执行队列里的 effect
+notify(): void {
+  if (this.flags & EffectFlags.RUNNING && !(this.flags & ALLOW_RECURSE)) {
+    return   // effect 正在运行中，防止自触发死循环
+  }
+  if (!(this.flags & EffectFlags.NOTIFIED)) {
+    batch(this)  // 还没入队，加进去
+  }
+  // 已是 NOTIFIED 则跳过，防止同一 effect 重复入队
+}
 ```
+
+### `batch()`（effect.ts:240）
+
+```typescript
+function batch(sub: Subscriber): void {
+  sub.flags |= EffectFlags.NOTIFIED   // 打标记：已在队列
+  sub.next = batchedSub               // 用 next 串成单链表
+  batchedSub = sub                    // batchedSub 始终指向链表头
+}
+// 结果：batchedSub → effect3 → effect2 → effect1 → undefined
+```
+
+### `endBatch()` 统一执行（effect.ts:262）
+
+```typescript
+export function endBatch(): void {
+  if (--batchDepth > 0) return   // 还有外层 batch，不执行
+
+  while (batchedSub) {
+    let e = batchedSub
+    batchedSub = undefined
+    while (e) {
+      const next = e.next
+      e.next = undefined
+      e.flags &= ~EffectFlags.NOTIFIED   // 清除标记
+      if (e.flags & EffectFlags.ACTIVE) {
+        e.trigger()   // → scheduler() → queueJob() → 下一帧渲染
+      }
+      e = next
+    }
+  }
+}
+```
+
+`batchDepth` 是引用计数，只有减到 0 才真正执行，不需要额外判断开始和结束。
+
+### `dep.notify()` 自带 `startBatch/endBatch` 的原因
+
+不是为了合并多次赋值，而是为了处理 **computed 级联通知**：
+
+```
+count 变化 → dep1.notify()
+  startBatch()   batchDepth=1
+  通知 effectA 入队
+  通知 computed C → C.dep.notify()   ← 嵌套触发
+    startBatch()   batchDepth=2
+    通知 effectB 入队
+    endBatch()     batchDepth=1  ← 不执行，等外层
+  endBatch()     batchDepth=0  ← 统一执行 effectA + effectB
+```
+
+没有这个机制，effectB 会在 effectA 入队前就执行，顺序乱掉。
+
+### `count.value = 1; count.value = 2` 的完整执行过程
+
+两次赋值各自触发独立的 `startBatch/endBatch`，**每次 `endBatch` 都会执行**，但最终只渲染一次：
+
+```
+count.value = 1
+  dep.notify()
+    startBatch()   batchDepth=1
+    effect.notify() → batch(effect)  NOTIFIED=true，入队
+    endBatch()     batchDepth=0 → 执行
+      effect.flags &= ~NOTIFIED      ← 清除标记
+      effect.trigger() → queueJob(job)  ✓ job 加入调度队列
+
+count.value = 2
+  dep.notify()
+    startBatch()   batchDepth=1
+    effect.notify() → NOTIFIED 已清除 → 再次 batch(effect) 入队
+    endBatch()     batchDepth=0 → 执行
+      effect.trigger() → queueJob(job)  ✗ job 已在队列，去重跳过
+
+下一个微任务 tick：
+  queue flush → job() 执行一次（count 此时 = 2）→ 渲染
+```
+
+### 批量合并的两层机制
+
+| 层 | 机制 | 作用 |
+|---|---|---|
+| `startBatch/endBatch` | `batchDepth` 计数 | 合并 computed 级联通知，保证顺序 |
+| `queueJob` 去重 | job.id 检查 | 合并多次数据变化为一次渲染 |
+
+单次赋值时第一层没效果（batchDepth 自己 1→0），防止多次渲染靠的是第二层 `queueJob` 去重。
 
 ---
 
@@ -347,6 +443,30 @@ count.value++  （写）
           → effect 标记 dirty，scheduler() → queueJob(job)
         → endBatch() → 执行队列 → 重新渲染
 ```
+
+---
+
+## 八、面试常考问题
+
+**Q：Vue 3 响应式原理是什么？**
+
+> `ref` 通过 getter/setter 拦截读写。读时调 `dep.track()`，若当前有 `activeSub`（正在运行的 effect）就建立 `Link` 关联；写时调 `dep.trigger()`，遍历所有订阅的 effect 通知更新，最终通过调度器 `queueJob` 异步批量执行渲染。
+
+**Q：Vue 3 为什么修改数据后不会立即触发多次渲染？**
+
+> 两层去重：① `effect.notify()` 里的 `NOTIFIED` 标志位防止同一 effect 在一次 `endBatch` 执行前重复入队；② 调度器 `queueJob` 按 job.id 去重，同一组件的渲染任务只会在微任务队列里存在一份，下一个 tick 统一执行一次。
+
+**Q：`ref` 和 `reactive` 的依赖收集有什么区别？**
+
+> `ref` 每个实例自带一个 `dep`，直接调 `dep.track()`；`reactive` 用全局 `targetMap（WeakMap<对象, Map<key, Dep>>）` 存储，按对象和 key 分别维护各自的 dep，通过 Proxy 拦截 get/set 触发 `track/trigger`。`WeakMap` 保证对象被 GC 时依赖数据自动释放。
+
+**Q：Vue 3 依赖收集为什么从 Set 改成双向链表？（Vue 3.4）**
+
+> Set 方案每次 effect 重跑都要清空重建，GC 压力大。双向链表方案用 `version=-1` 标记旧依赖，重跑时原地复用 `Link` 对象，只清理真正失效的节点（O(1) 删除）。同一个 `Link` 节点同时挂在 effect.deps 和 dep.subs 两条链表上，零额外内存开销。
+
+**Q：`startBatch/endBatch` 和 `queueJob` 分别解决什么问题？**
+
+> `startBatch/endBatch` 用 `batchDepth` 引用计数解决 **computed 级联通知的顺序问题**——防止内层 endBatch 提前执行导致顺序错乱。`queueJob` 解决**多次赋值只渲染一次的问题**——调度器按 job.id 去重，同一组件无论触发多少次更新，渲染任务只在队列里存一份。
 
 ---
 
