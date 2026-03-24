@@ -636,6 +636,10 @@ count.value++  （写）
 
 > Set 方案每次 effect 重跑都要清空重建，GC 压力大。双向链表方案用 `version=-1` 标记旧依赖，重跑时原地复用 `Link` 对象，只清理真正失效的节点（O(1) 删除）。同一个 `Link` 节点同时挂在 effect.deps 和 dep.subs 两条链表上，零额外内存开销。
 
+**Q：`watch` 和 `watchEffect` 的区别？底层如何实现？**
+
+> 两者都基于 `ReactiveEffect`，走同一个 `baseWatch` 函数。区别在于：`watchEffect` 把用户函数直接作为 getter，立即执行并自动收集依赖，数据变化后直接重跑；`watch` 把 source 包装成 getter，首次只运行 getter 收集依赖而不触发 cb，数据变化后运行 getter 得到新值，通过 `hasChanged` 对比新旧值，真的变化才调用 cb 并传入 `(newVal, oldVal)`。
+
 **Q：`startBatch/endBatch` 和 `queueJob` 分别解决什么问题？**
 
 > `startBatch/endBatch` 用 `batchDepth` 引用计数解决 **computed 级联通知的顺序问题**——防止内层 endBatch 提前执行导致顺序错乱。`queueJob` 解决**多次赋值只渲染一次的问题**——调度器按 job.id 去重，同一组件无论触发多少次更新，渲染任务只在队列里存一份。
@@ -773,10 +777,105 @@ state.nested = { a: 99 }  // ✅ 触发更新（替换整个 nested 是根层级
 
 ---
 
+## 十四、`watch` / `watchEffect`
+
+### 作用区别
+
+```
+watchEffect(() => { ... })
+  → 立即执行，自动收集内部依赖，依赖变化重新执行
+  → 不关心具体哪个值变了，只关心"要执行这段逻辑"
+
+watch(source, (newVal, oldVal) => { ... })
+  → 明确指定监听源，懒执行（默认不立即运行）
+  → 能拿到新旧值，关心"具体哪个值变了、变成了什么"
+```
+
+### 底层实现：两者都走 `doWatch` → `baseWatch`（reactivity/watch.ts）
+
+**第一步：把 source 统一包成 getter 函数（watch.ts:153）**
+
+```typescript
+if (isRef(source)) {
+  getter = () => source.value          // ref → 读 .value
+} else if (isReactive(source)) {
+  getter = () => traverse(source)      // reactive → 深度遍历收集所有依赖
+} else if (isFunction(source)) {
+  if (cb) {
+    getter = source                    // watch(fn, cb) → fn 是 getter
+  } else {
+    getter = () => source(cleanup)     // watchEffect → source 本身就是 getter
+  }
+}
+```
+
+**第二步：创建 `ReactiveEffect(getter)`（watch.ts:286）**
+
+```typescript
+effect = new ReactiveEffect(getter)
+effect.scheduler = () => scheduler(job, false)
+```
+
+与组件渲染 effect 完全相同的机制，区别只在 getter 和 job 的内容。
+
+**第三步：`job` 函数处理新旧值（watch.ts:233）**
+
+```typescript
+const job = () => {
+  if (cb) {
+    // watch：运行 getter 得到新值，值真的变了才触发 cb
+    const newValue = effect.run()
+    if (hasChanged(newValue, oldValue)) {
+      cb(newValue, oldValue, onCleanup)
+      oldValue = newValue              // 更新 oldValue 供下次对比
+    }
+  } else {
+    // watchEffect：直接运行 getter（用户传入的函数）
+    effect.run()
+  }
+}
+```
+
+**第四步：首次运行（watch.ts:312）**
+
+```typescript
+if (cb) {
+  if (immediate) {
+    job(true)              // watch + immediate：立即触发 cb
+  } else {
+    oldValue = effect.run()  // watch 默认：只跑 getter 收集依赖，不触发 cb
+  }
+} else {
+  effect.run()             // watchEffect：立即运行
+}
+```
+
+### flush 调度时机（apiWatch.ts）
+
+```
+flush: 'pre'（默认）  → DOM 更新前执行，用 queueJob
+flush: 'post'        → DOM 更新后执行，用 queuePostRenderEffect
+flush: 'sync'        → 数据变化立即同步执行，不进队列
+```
+
+`watchPostEffect` 和 `watchSyncEffect` 就是预设了 flush 的 `watchEffect` 快捷方式。
+
+### 完整对比
+
+| | `watchEffect` | `watch` |
+|--|--|--|
+| 依赖收集 | 自动（运行时收集） | 手动指定 source |
+| 首次执行 | 立即 | 默认不执行（`immediate:true` 才执行）|
+| 新旧值 | 无 | 有 `(newVal, oldVal)` |
+| getter | source 本身 | 根据 source 类型包装成 getter |
+| 底层 | `ReactiveEffect(source)` | `ReactiveEffect(getter)` + job 比较新旧值 |
+| 适用场景 | 副作用同步（DOM 操作、网络请求） | 监听特定值变化，需要新旧值对比 |
+
+---
+
 ## 暂跳过的部分
 
 - `computed()` 的懒计算与缓存机制
-- `watch` / `watchEffect` 的实现
 - `effect.ts` 中 `prepareDeps` / `cleanupDeps` 的完整逻辑
 - `collectionHandlers`（Map / Set / WeakMap / WeakSet 的响应式处理）
 - 数组的特殊拦截（`arrayInstrumentations`）
