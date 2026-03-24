@@ -415,7 +415,181 @@ count.value = 2
 
 ---
 
-## 六、两套 `track/trigger` 的区别
+## 六、`reactive` 与 Proxy
+
+### `ref` vs `reactive` 拦截方式对比
+
+两种响应式 API 用了完全不同的拦截机制：
+
+| | `ref` | `reactive` |
+|--|--|--|
+| 拦截方式 | class getter/setter | Proxy |
+| 适用场景 | 单值（number/string/...） | 对象/数组 |
+| dep 存储 | RefImpl 实例上直接有 `dep` | `targetMap[target][key]` |
+| 访问方式 | `.value` | 直接读属性 |
+
+### `ref(对象/数组)` 内部也用了 `reactive`
+
+`RefImpl` 构造时调用 `toReactive`（reactive.ts:430）：
+
+```typescript
+export const toReactive = <T>(value: T): T =>
+  isObject(value) ? reactive(value) : value   // 是对象就包 reactive
+```
+
+所以：
+- `ref(0)` → `_value = 0`（原始值）
+- `ref({ a: 1 })` → `_value = reactive({ a: 1 })`（Proxy）
+- `ref([1,2,3])` → `_value = reactive([1,2,3])`（Proxy）
+
+**两层追踪（以 `ref([1,2,3])` 为例）：**
+
+```
+arr.value         → ref 的 dep.track()    追踪 .value 整体替换
+arr.value[0]      → Proxy get 拦截        追踪数组第 0 项被读
+arr.value[0] = 99 → Proxy set 拦截        触发数组第 0 项变化
+arr.value = [4,5] → ref 的 dep.trigger()  触发 .value 被替换
+```
+
+### `reactive` 如何创建 Proxy（reactive.ts:296）
+
+```typescript
+const proxy = new Proxy(
+  target,
+  targetType === TargetType.COLLECTION ? collectionHandlers : baseHandlers,
+)
+proxyMap.set(target, proxy)   // 缓存，同一对象不重复创建
+return proxy
+```
+
+`baseHandlers` 分两个实现类：
+
+```
+BaseReactiveHandler           公共 get 逻辑
+  ├── MutableReactiveHandler  → reactive()  可读可写
+  └── ReadonlyReactiveHandler → readonly()  只读
+```
+
+### `baseHandlers` 的 get 拦截（baseHandlers.ts:55）
+
+```typescript
+get(target, key, receiver) {
+  // ...处理特殊 key（IS_REACTIVE / IS_READONLY / RAW 等）
+
+  const res = Reflect.get(target, key, receiver)
+
+  if (!isReadonly) {
+    track(target, TrackOpTypes.GET, key)   // 收集依赖
+  }
+
+  if (isObject(res)) {
+    return isReadonly ? readonly(res) : reactive(res)  // 懒代理嵌套对象
+  }
+
+  return res
+}
+```
+
+**懒代理**：不在初始化时递归处理所有属性，只有真正访问到嵌套对象时才包 Proxy，性能更优。
+
+---
+
+## 七、为什么 Vue 3 用 Proxy 替代 `Object.defineProperty`
+
+### `Object.defineProperty` 的三个根本缺陷
+
+**1. 新增属性监听不到**
+```javascript
+const obj = reactive({ a: 1 })
+obj.b = 2   // ❌ 监听不到，Vue 2 必须用 Vue.set(obj, 'b', 2)
+```
+
+**2. 数组下标和 length 监听不到**
+```javascript
+arr[0] = 99      // ❌ 监听不到
+arr.length = 0   // ❌ 监听不到
+// Vue 2 为此重写了 push/pop/splice 等 7 个方法，是 hack 而非原生支持
+```
+
+**3. 初始化必须递归全量处理**
+```javascript
+function observe(obj) {
+  Object.keys(obj).forEach(key => {
+    defineReactive(obj, key, obj[key])  // 每个 key 都要处理
+    if (isObject(obj[key])) observe(obj[key])  // 深层递归，哪怕从不访问
+  })
+}
+```
+
+### Proxy 如何解决这三个问题
+
+| 问题 | Proxy 方案 |
+|------|-----------|
+| 新增属性 | 拦截对象所有操作，新 key 的 set 也能捕获 |
+| 数组下标/length | set 拦截原生支持，无需 hack |
+| 初始化性能 | 懒代理，get 时才递归包子对象，不访问不处理 |
+
+Proxy 还额外支持 `deleteProperty`、`has`、`ownKeys` 等拦截，能力远超 `defineProperty`。
+
+**唯一代价**：不支持 IE。
+
+---
+
+## 八、`readonly` 的实现
+
+### 核心：只换 handler，set/delete 拦截直接拒绝
+
+`readonly()` 和 `reactive()` 走同一套 `createReactiveObject`，只是传入的 handler 不同：
+
+```typescript
+// ReadonlyReactiveHandler（baseHandlers.ts:225）
+class ReadonlyReactiveHandler extends BaseReactiveHandler {
+  constructor(isShallow = false) {
+    super(true, isShallow)   // _isReadonly = true
+  }
+
+  set(target, key) {
+    if (__DEV__) warn(`Set operation on key "${key}" failed: target is readonly.`)
+    return true   // 拦截写入，静默失败（不实际执行，不 trigger）
+  }
+
+  deleteProperty(target, key) {
+    if (__DEV__) warn(`Delete operation on key "${key}" failed: target is readonly.`)
+    return true   // 拦截删除，同上
+  }
+}
+```
+
+### get 里的两处 readonly 判断
+
+```typescript
+// 1. readonly 不收集依赖（数据不会变，track 没意义）
+if (!isReadonly) {
+  track(target, TrackOpTypes.GET, key)
+}
+
+// 2. 嵌套对象也递归包成 readonly（深度只读）
+if (isObject(res)) {
+  return isReadonly ? readonly(res) : reactive(res)
+}
+```
+
+### 对比
+
+```
+reactive(obj)  →  MutableReactiveHandler
+  get: track()           读时收集依赖
+  set: trigger()         写时通知更新
+
+readonly(obj)  →  ReadonlyReactiveHandler
+  get: 不 track          数据不会变，收集没意义
+  set: 警告 + 拒绝       静默失败，不触发更新
+  嵌套对象: readonly()   深层也只读
+```
+
+---
+
+## 九、两套 `track/trigger` 的区别
 
 | | 位置 | 调用方 | 原因 |
 |--|--|--|--|
@@ -426,18 +600,14 @@ count.value = 2
 
 ```
 targetMap（WeakMap）
-  └─ obj → Map {
-               'name' → Dep,
-               'age'  → Dep,
-               ...
-            }
+  └─ obj → Map { 'name' → Dep, 'age' → Dep, ... }
 ```
 
 `WeakMap` 的好处：对象被 GC 回收后，对应的依赖数据自动释放，不会内存泄漏。
 
 ---
 
-## 七、完整响应式链路
+## 十、完整响应式链路
 
 ```
 const count = ref(0)
@@ -446,30 +616,124 @@ const count = ref(0)
 ─── 渲染时（effect.run() 执行中）───
 
 count.value  （读）
-  → get value()
-    → dep.track()
-      → activeSub 不为空（effect 正在跑）
-      → new Link(effect, dep)
-      → effect.deps 链表追加
-      → dep.subs 链表追加
+  → get value() → dep.track()
+      → activeSub 不为空 → new Link(effect, dep)
+      → effect.deps 链表追加；dep.subs 链表追加
 
 ─── 数据变化 ───
 
 count.value++  （写）
-  → set value()
-    → hasChanged() ✓
+  → set value() → hasChanged() ✓
     → dep.trigger()
       → dep.version++  globalVersion++
       → dep.notify()
         → startBatch()
-        → 遍历 dep.subs，link.sub.notify()
-          → effect 标记 dirty，scheduler() → queueJob(job)
-        → endBatch() → 执行队列 → 重新渲染
+        → 遍历 dep.subs，link.sub.notify() → effect 入队
+        → endBatch() → effect.trigger() → queueJob → 下一帧渲染
 ```
+
+**Q：Vue 3 依赖收集为什么从 Set 改成双向链表？（Vue 3.4）**
+
+> Set 方案每次 effect 重跑都要清空重建，GC 压力大。双向链表方案用 `version=-1` 标记旧依赖，重跑时原地复用 `Link` 对象，只清理真正失效的节点（O(1) 删除）。同一个 `Link` 节点同时挂在 effect.deps 和 dep.subs 两条链表上，零额外内存开销。
+
+**Q：`startBatch/endBatch` 和 `queueJob` 分别解决什么问题？**
+
+> `startBatch/endBatch` 用 `batchDepth` 引用计数解决 **computed 级联通知的顺序问题**——防止内层 endBatch 提前执行导致顺序错乱。`queueJob` 解决**多次赋值只渲染一次的问题**——调度器按 job.id 去重，同一组件无论触发多少次更新，渲染任务只在队列里存一份。
 
 ---
 
-## 八、面试常考问题
+## 十一、`toRef` / `toRefs`
+
+### `toRef` 的四种形态（ref.ts:482）
+
+```typescript
+toRef(existingRef)           // 已是 ref → 直接返回，不重复包装
+toRef(() => props.foo)       // getter 函数 → GetterRefImpl（只读 ref）
+toRef(reactiveObj, 'key')    // reactive 对象 + key → ObjectRefImpl（最常用）
+toRef(1)                     // 普通值 → 等价于 ref(1)
+```
+
+### `ObjectRefImpl`：穿透代理（ref.ts:356）
+
+```typescript
+class ObjectRefImpl {
+  get value() {
+    return this._object[this._key]    // 读：穿透到原 reactive 对象
+  }
+  set value(newVal) {
+    this._object[this._key] = newVal  // 写：穿透到原 reactive 对象
+  }
+  get dep() {
+    return getDepFromReactive(this._raw, this._key)  // dep 也是原对象的
+  }
+}
+```
+
+**没有自己的 dep**，响应式完全由原 reactive 对象的 Proxy 保证，`ObjectRefImpl` 只是一层薄包装。
+
+### `toRefs`：批量 toRef（ref.ts:345）
+
+```typescript
+function toRefs(object) {
+  const ret = isArray(object) ? new Array(object.length) : {}
+  for (const key in object) {
+    ret[key] = propertyToRef(object, key)  // 每个 key 都 toRef 一遍
+  }
+  return ret
+}
+```
+
+### 为什么需要 `toRefs`
+
+```javascript
+const state = reactive({ x: 1, y: 2 })
+
+const { x, y } = state           // ❌ 解构丢失响应式，拿到普通值
+const { x, y } = toRefs(state)   // ✅ 每个值都是 ref，响应式保留
+// x.value === 1，修改 x.value 会同步到 state.x，反之亦然
+```
+
+在 `setup()` 中把 reactive 对象解构返回时必须用 `toRefs`，否则模板中失去响应式。
+
+---
+
+## 十二、`shallowReactive` vs `reactive`
+
+### 区别的本质：一行代码
+
+两者走完全相同的流程，只是 handler 构造时 `_isShallow` 不同。
+
+get 拦截器里的这个判断决定了全部差异（baseHandlers.ts:116）：
+
+```typescript
+if (isShallow) {
+  return res          // shallow：直接返回，不再递归包 Proxy
+}
+if (isObject(res)) {
+  return reactive(res) // 普通 reactive：嵌套对象继续包 Proxy（深度响应式）
+}
+```
+
+### 具体表现
+
+```javascript
+const state = shallowReactive({
+  count: 1,           // ✅ 响应式（根层级）
+  nested: { a: 1 },  // ❌ 非响应式（嵌套对象是原始对象，非 Proxy）
+})
+
+state.count = 2           // ✅ 触发更新
+state.nested.a = 2        // ❌ 不触发更新
+state.nested = { a: 99 }  // ✅ 触发更新（替换整个 nested 是根层级操作）
+```
+
+### 使用场景
+
+大型列表、嵌套层级深但只需要追踪根层级属性时用 `shallowReactive`，避免深层递归代理的性能开销。
+
+---
+
+## 十三、面试常考问题
 
 **Q：Vue 3 响应式原理是什么？**
 
@@ -483,6 +747,22 @@ count.value++  （写）
 
 > `ref` 每个实例自带一个 `dep`，直接调 `dep.track()`；`reactive` 用全局 `targetMap（WeakMap<对象, Map<key, Dep>>）` 存储，按对象和 key 分别维护各自的 dep，通过 Proxy 拦截 get/set 触发 `track/trigger`。`WeakMap` 保证对象被 GC 时依赖数据自动释放。
 
+**Q：为什么 Vue 3 用 Proxy 替代 `Object.defineProperty`？**
+
+> `Object.defineProperty` 只能拦截已有属性的读写，新增属性、数组下标/length 变更都无能为力，且初始化时必须递归全量处理所有属性。Proxy 代理整个对象的所有操作，天然支持新增属性和数组变更，采用懒代理策略（get 时才递归包子对象），初始化性能更优。唯一代价是不支持 IE。
+
+**Q：`readonly` 是如何实现的？**
+
+> 本质是换了一套 Proxy handler（`ReadonlyReactiveHandler`），`set` 和 `deleteProperty` 被覆盖为"开发环境警告 + 静默拒绝"，不调用 `trigger`；`get` 里不调 `track`（数据不会变，收集没意义）；访问嵌套对象时递归包 `readonly`，实现深度只读。
+
+**Q：`toRef` 和 `toRefs` 的作用？**
+
+> `toRef(reactiveObj, 'key')` 创建一个 `ObjectRefImpl`，读写都穿透到原 reactive 对象，自身没有独立 dep，响应式由原对象的 Proxy 保证。`toRefs` 是批量版本，对 reactive 对象每个 key 执行 `toRef`，返回普通对象。主要用途是解构 reactive 对象时保持响应式连接。
+
+**Q：`shallowReactive` 和 `reactive` 的区别？**
+
+> 区别只在 get 拦截器里的一行判断：`reactive` 访问嵌套对象时递归包 Proxy（深度响应式）；`shallowReactive` 设置 `_isShallow=true`，get 时直接返回原始值，嵌套对象不再代理。根层级属性变化可以响应，嵌套属性变化不响应。适合大型列表等只需追踪根层级的场景。
+
 **Q：Vue 3 依赖收集为什么从 Set 改成双向链表？（Vue 3.4）**
 
 > Set 方案每次 effect 重跑都要清空重建，GC 压力大。双向链表方案用 `version=-1` 标记旧依赖，重跑时原地复用 `Link` 对象，只清理真正失效的节点（O(1) 删除）。同一个 `Link` 节点同时挂在 effect.deps 和 dep.subs 两条链表上，零额外内存开销。
@@ -495,7 +775,8 @@ count.value++  （写）
 
 ## 暂跳过的部分
 
-- `reactive()` / Proxy 的 get/set 拦截器（`baseHandlers.ts`）
 - `computed()` 的懒计算与缓存机制
 - `watch` / `watchEffect` 的实现
 - `effect.ts` 中 `prepareDeps` / `cleanupDeps` 的完整逻辑
+- `collectionHandlers`（Map / Set / WeakMap / WeakSet 的响应式处理）
+- 数组的特殊拦截（`arrayInstrumentations`）
