@@ -4,6 +4,7 @@
 
 | 文件 | 内容 | 状态 |
 |------|------|------|
+| [00-学习路线.md](./00-学习路线.md) | 整体学习路线：两条主线、学习顺序与理由、知识地图 | ✅ |
 | [01-createApp.md](./01-createApp.md) | 应用启动：createApp → mount → 与响应式的汇合点 | ✅ |
 | [02-renderer-overview.md](./02-renderer-overview.md) | renderer 导读：baseCreateRenderer 学习策略与主线顺序 | ✅ |
 | [03-setupRenderEffect.md](./03-setupRenderEffect.md) | 响应式与渲染的连接点：setupRenderEffect 详解 | ✅ |
