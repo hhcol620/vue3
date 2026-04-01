@@ -185,8 +185,80 @@ setupRenderEffect()
 
 ---
 
+## 四、为什么数据多次变更只渲染一次：queueJob 去重机制
+
+### 去重靠 QUEUED flag，不是 uid
+
+```typescript
+// scheduler.ts:99
+export function queueJob(job: SchedulerJob): void {
+  if (!(job.flags! & SchedulerJobFlags.QUEUED)) {  // 还没入队才处理
+    queue.push(job)
+    job.flags! |= SchedulerJobFlags.QUEUED          // 打上"已入队"标记
+    queueFlush()                                    // 触发异步刷新
+  }
+  // 已有 QUEUED 标记 → 直接跳过，不重复入队
+}
+
+function queueFlush() {
+  if (!currentFlushPromise) {
+    currentFlushPromise = resolvedPromise.then(flushJobs)  // 微任务
+  }
+}
+```
+
+完整流程：
+
+```
+count.value = 1
+  → dep.trigger() → queueJob(job)
+  → 无 QUEUED 标记 → 入队，打上 QUEUED 标记
+  → Promise.then(flushJobs)（异步，还没执行）
+
+count.value = 2
+  → dep.trigger() → queueJob(job)
+  → 已有 QUEUED 标记 → 直接跳过
+
+--- 当前同步代码执行完 ---
+
+Promise.then 触发 flushJobs()
+  → 执行 job（只有一个）→ 只渲染一次
+  → 清除 QUEUED 标记
+```
+
+### job.id = instance.uid 的作用：排序，不是去重
+
+```typescript
+job.id = instance.uid
+// flushJobs 按 id 从小到大执行
+queue.splice(findInsertionIndex(jobId), 0, job)
+```
+
+父组件 uid 比子组件小（先创建），所以 flushJobs 按 id 升序执行，保证**父组件先于子组件更新**，避免子组件用旧 props 渲染。
+
+### 一句话总结
+
+> 去重靠 **`QUEUED` flag 位**（同一 job 不重复入队）；`uid` 是排序用的，保证父子组件更新顺序正确；`Promise.then` 把渲染推到微任务，收集完所有同步变更后只渲染一次。
+
+---
+
+## 面试角度总结
+
+**问：Vue 3 响应式是怎么驱动视图更新的？**
+
+> 组件挂载时，`setupRenderEffect` 把组件的渲染函数包进 `ReactiveEffect`，首次执行时自动收集所有用到的响应式数据作为依赖。数据变化后触发 `scheduler`，把更新任务推入微任务队列，下一个 tick 批量执行，生成新 vnode 后调 `patch` 做 DOM diff 更新视图。
+
+**问：Vue 3 为什么多次修改数据只会触发一次渲染？**
+
+> `queueJob` 通过 `QUEUED` flag 位做去重：同一个 job 第一次入队后打上标记，后续相同 job 直接跳过。所有同步代码执行完后，微任务 `Promise.then(flushJobs)` 才真正执行队列，所以无论修改几次数据，最终只渲染一次。
+
+**问：`job.id = instance.uid` 有什么用？**
+
+> 用于控制 flushJobs 的执行顺序。uid 按组件创建顺序递增，父组件 uid 更小，所以队列按 id 升序执行，确保父组件总是先于子组件更新，避免子组件渲染时拿到旧的 props。
+
+---
+
 ## 暂跳过的部分
 
 - `renderComponentRoot` 内部（如何执行 render 函数、处理 slots 等）
-- `queueJob` / `scheduler.ts` 队列调度机制
 - `instance.scope` 的作用（effect 作用域，组件卸载时批量停止）
